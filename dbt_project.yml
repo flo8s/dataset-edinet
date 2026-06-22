@@ -1,0 +1,31 @@
+name: "edinet"
+version: "1.0.0"
+
+profile: "edinet"
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros", "shared/macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+seeds:
+  edinet:
+    +database: edinet
+    +schema: main
+
+models:
+  edinet:
+    +database: edinet
+    main:
+      raw:
+        +materialized: view
+      stg:
+        +materialized: view
+      mart:
+        +materialized: table

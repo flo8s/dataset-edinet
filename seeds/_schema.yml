@@ -1,0 +1,12 @@
+version: 2
+
+seeds:
+  - name: doc_types
+    description: |
+      EDINET 書類種別コード（docTypeCode）と名称の対応表。
+      出典: EDINET API 仕様書 Version 2「4-1 参考資料 書類種別コード」
+    columns:
+      - name: doc_type_code
+        description: 書類種別コード（3桁）
+      - name: doc_type_name
+        description: 書類種別名称

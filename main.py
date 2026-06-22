@@ -1,0 +1,249 @@
+"""EDINET 書類一覧 API 取得 + dbt build パイプライン。
+
+書類一覧 API (documents.json) を日付単位で走査し、提出書類のメタデータを
+fdl の DuckLake カタログ (FDL_* 環境変数で注入) の ``_source.documents`` に
+書き込んでから dbt で変換する。R2 への公開は fdl run/sync の publish が担う。
+
+差分更新:
+- 未取得日のみ取得する（進捗を ``_source.fetch_progress`` に日単位で永続化し、
+  CI が途中で切れても次回続きから再開する）。
+- 直近ウィンドウ (RECENT_REFETCH_DAYS) は毎回再取得し、書類情報修正・取下げを
+  取り込む。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+
+import duckdb
+import pyarrow as pa
+from dbt.cli.main import dbtRunner
+
+from edinet.client import EdinetClient
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
+
+DOCUMENTS_TABLE = "edinet._source.documents"
+PROGRESS_TABLE = "edinet._source.fetch_progress"
+
+# 書類一覧 API results の項目（出力順）。_source には VARCHAR でそのまま保持し、
+# 型付け・リネームは stg 層で行う（reinfolib と同じ方針）。
+API_FIELDS = [
+    "seqNumber",
+    "docID",
+    "edinetCode",
+    "secCode",
+    "JCN",
+    "filerName",
+    "fundCode",
+    "ordinanceCode",
+    "formCode",
+    "docTypeCode",
+    "periodStart",
+    "periodEnd",
+    "submitDateTime",
+    "docDescription",
+    "issuerEdinetCode",
+    "subjectEdinetCode",
+    "subsidiaryEdinetCode",
+    "currentReportReason",
+    "parentDocID",
+    "opeDateTime",
+    "withdrawalStatus",
+    "docInfoEditStatus",
+    "disclosureStatus",
+    "xbrlFlag",
+    "pdfFlag",
+    "attachDocFlag",
+    "englishDocFlag",
+    "csvFlag",
+    "legalStatus",
+]
+
+_ARROW_SCHEMA = pa.schema(
+    [(f, pa.string()) for f in API_FIELDS] + [("_fetch_date", pa.date32())]
+)
+
+# 閲覧可能期間は書類種別ごとに最長 10 年（縦覧 + 延長）。これより古い日付は
+# 原則 0 件で返るため、既定の遡及開始日は約 10 年前に置く。環境変数で上書き可。
+DEFAULT_BACKFILL_START = "2016-01-01"
+RECENT_REFETCH_DAYS = 7
+
+# 1 回の実行で取得する日数の上限。全期間バックフィル（約 3,800 日）を 1 回で
+# 走らせると CI のジョブ上限を超え、push 前に打ち切られて永続化できない。
+# 1 回あたりを上限内に収め、毎回 build + push まで完走させる。進捗は
+# fetch_progress に永続化され、fdl pull で次回取り込まれるため、日次 cron で
+# 数日かけて履歴が埋まる。未取得分は新しい日付から順に取得する。
+DEFAULT_MAX_DATES_PER_RUN = 1000
+
+
+@contextmanager
+def _ducklake_connect() -> Generator[duckdb.DuckDBPyConnection]:
+    """fdl 管理の DuckLake をアタッチした新規 DuckDB セッションを開く。
+
+    ``fdl run`` が注入する ``FDL_*`` 環境変数（SQLite ライブカタログ
+    ``FDL_CATALOG_PATH`` とデータ位置 ``FDL_DATA_URL``）を使う。カタログが
+    存在しない初回アタッチ時には作成される。
+    """
+    catalog_path = os.environ["FDL_CATALOG_PATH"]
+    data_url = os.environ["FDL_DATA_URL"]
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.execute("INSTALL ducklake; LOAD ducklake;")
+        conn.execute("INSTALL sqlite; LOAD sqlite;")
+        if data_url.startswith("s3://"):
+            conn.execute("INSTALL httpfs; LOAD httpfs;")
+            conn.execute(
+                "CREATE SECRET (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, "
+                "URL_STYLE 'path', REGION 'auto')",
+                [
+                    os.environ["FDL_S3_ACCESS_KEY_ID"],
+                    os.environ["FDL_S3_SECRET_ACCESS_KEY"],
+                    os.environ["FDL_S3_ENDPOINT_HOST"],
+                ],
+            )
+        conn.execute(
+            f"ATTACH 'ducklake:{catalog_path}' AS edinet "
+            f"(DATA_PATH '{data_url}', OVERRIDE_DATA_PATH true, "
+            f"META_TYPE 'sqlite', META_JOURNAL_MODE 'WAL', BUSY_TIMEOUT 5000)"
+        )
+        yield conn
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    target = os.environ.get("DBT_TARGET", sys.argv[1] if len(sys.argv) > 1 else "default")
+
+    api_key = os.environ["EDINET_API_KEY"]
+    rate = float(os.environ.get("EDINET_RATE_LIMIT_SECONDS", "4"))
+    start = date.fromisoformat(
+        os.environ.get("EDINET_BACKFILL_START", DEFAULT_BACKFILL_START)
+    )
+    end = date.today()
+
+    client = EdinetClient(api_key, rate_limit_seconds=rate)
+    with _ducklake_connect() as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS edinet._source")
+        _ensure_tables(conn)
+        targets = _dates_to_fetch(conn, start, end)
+        logger.info("fetch %d dates (%s 〜 %s)", len(targets), start, end)
+        ingest_documents(conn, client, targets)
+
+    dbt = dbtRunner()
+    for cmd in (
+        ["deps"],
+        ["seed", "--target", target],
+        ["run", "--target", target],
+        ["docs", "generate", "--target", target],
+    ):
+        result = dbt.invoke(cmd)
+        if not result.success:
+            raise SystemExit(f"dbt {' '.join(cmd)} failed")
+
+
+def ingest_documents(
+    conn: duckdb.DuckDBPyConnection,
+    client: EdinetClient,
+    targets: list[date],
+) -> None:
+    """対象日ごとに書類一覧を取得し、日単位で upsert + 進捗永続化する。"""
+    total = len(targets)
+    for i, d in enumerate(targets, 1):
+        results = client.get_documents(d.isoformat())
+        _write_date(conn, d, results)
+        if i % 50 == 0 or i == total:
+            n = conn.execute(f"SELECT count(*) FROM {DOCUMENTS_TABLE}").fetchone()[0]
+            logger.info("  %d/%d dates (last=%s, total rows=%d)", i, total, d, n)
+
+
+def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    cols = ", ".join(f'"{f}" VARCHAR' for f in API_FIELDS)
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {DOCUMENTS_TABLE} ({cols}, _fetch_date DATE)"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} "
+        "(fetch_date DATE, fetched_at TIMESTAMP, doc_count INTEGER)"
+    )
+
+
+def _dates_to_fetch(
+    conn: duckdb.DuckDBPyConnection, start: date, end: date
+) -> list[date]:
+    """直近ウィンドウ（毎回再取得）+ 未取得のバックログ（新しい日付優先、上限あり）を昇順で返す。
+
+    1 回の実行を ``EDINET_MAX_DATES_PER_RUN`` 日以内に収め、毎回 build + push まで
+    完走させる。直近ウィンドウは書類情報修正・取下げの取り込みのため常に再取得し、
+    残り枠で未取得のバックログを新しい日付から埋める。
+    """
+    done = _fetched_dates(conn)
+    cap = int(os.environ.get("EDINET_MAX_DATES_PER_RUN", str(DEFAULT_MAX_DATES_PER_RUN)))
+    recent_floor = max(start, end - timedelta(days=RECENT_REFETCH_DAYS - 1))
+
+    recent: list[date] = []
+    d = recent_floor
+    while d <= end:
+        recent.append(d)
+        d += timedelta(days=1)
+
+    backlog: list[date] = []  # 新しい日付から順に未取得日を集める
+    d = recent_floor - timedelta(days=1)
+    while d >= start:
+        if d not in done:
+            backlog.append(d)
+        d -= timedelta(days=1)
+
+    remaining = max(0, cap - len(recent))
+    return sorted(set(recent + backlog[:remaining]))
+
+
+def _fetched_dates(conn: duckdb.DuckDBPyConnection) -> set[date]:
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                f"SELECT fetch_date FROM {PROGRESS_TABLE}"
+            ).fetchall()
+        }
+    except duckdb.CatalogException:
+        return set()
+
+
+def _write_date(
+    conn: duckdb.DuckDBPyConnection, d: date, results: list[dict]
+) -> None:
+    """1 日分の書類一覧を 1 トランザクションで置き換え、進捗を記録する。"""
+    rows = [_normalize(r, d) for r in results]
+    conn.execute("BEGIN")
+    conn.execute(f"DELETE FROM {DOCUMENTS_TABLE} WHERE _fetch_date = ?", [d])
+    if rows:
+        conn.register("_batch", pa.Table.from_pylist(rows, schema=_ARROW_SCHEMA))
+        conn.execute(f"INSERT INTO {DOCUMENTS_TABLE} SELECT * FROM _batch")
+        conn.unregister("_batch")
+    conn.execute(f"DELETE FROM {PROGRESS_TABLE} WHERE fetch_date = ?", [d])
+    conn.execute(
+        f"INSERT INTO {PROGRESS_TABLE} VALUES (?, ?, ?)",
+        [d, datetime.now(), len(rows)],
+    )
+    conn.execute("COMMIT")
+
+
+def _normalize(row: dict, d: date) -> dict:
+    """API の 1 件を _source.documents の行 dict に変換する（全項目 VARCHAR）。"""
+    out: dict[str, object] = {
+        f: (None if row.get(f) is None else str(row.get(f))) for f in API_FIELDS
+    }
+    out["_fetch_date"] = d
+    return out
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: edinet_source
+    database: edinet
+    schema: _source
+    tables:
+      - name: documents
+        description: EDINET 書類一覧 API (documents.json, type=2) の提出書類メタデータ

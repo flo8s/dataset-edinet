@@ -1,0 +1,25 @@
+[project]
+name = "dataset-edinet"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "frozen-ducklake>=0.10.3,<0.11",
+    "dbt-core>=1.11.2",
+    "dbt-duckdb>=1.10.0",
+    "boto3>=1.35",
+    "pyarrow",
+]
+
+[tool.queria]
+name = "edinet"
+title = "EDINET 書類一覧"
+description = "金融庁 EDINET の開示書類一覧（有価証券報告書・四半期報告書・大量保有報告書等のメタデータ）。提出者法人番号付きで houjin_bangou / gbizinfo と結合できる。"
+cover = "📑"
+tags = ["EDINET", "有価証券報告書", "開示", "企業", "法人番号"]
+license = "金融庁 EDINET 利用規約"
+license_url = "https://disclosure2.edinet-fsa.go.jp/"
+repository_url = "https://github.com/flo8s/dataset-edinet"
+schedule = "daily"
+
+[tool.queria.schemas.main]
+title = "EDINET 書類一覧"
