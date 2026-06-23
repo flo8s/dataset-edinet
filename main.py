@@ -25,6 +25,7 @@ import pyarrow as pa
 from dbt.cli.main import dbtRunner
 
 from edinet.client import EdinetClient
+from edinet.codelist import COMPANY_FIELDS, fetch_company_master
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -32,6 +33,7 @@ logger.addHandler(logging.StreamHandler())
 
 DOCUMENTS_TABLE = "edinet._source.documents"
 PROGRESS_TABLE = "edinet._source.fetch_progress"
+COMPANIES_TABLE = "edinet._source.companies"
 
 # 書類一覧 API results の項目（出力順）。_source には VARCHAR でそのまま保持し、
 # 型付け・リネームは stg 層で行う（reinfolib と同じ方針）。
@@ -69,6 +71,10 @@ API_FIELDS = [
 
 _ARROW_SCHEMA = pa.schema(
     [(f, pa.string()) for f in API_FIELDS] + [("_fetch_date", pa.date32())]
+)
+
+_COMPANIES_ARROW_SCHEMA = pa.schema(
+    [(f, pa.string()) for f in COMPANY_FIELDS] + [("_fetched_at", pa.timestamp("us"))]
 )
 
 # 閲覧可能期間は書類種別ごとに最長 10 年（縦覧 + 延長）。これより古い日付は
@@ -136,6 +142,7 @@ def main() -> None:
         targets = _dates_to_fetch(conn, start, end)
         logger.info("fetch %d dates (%s 〜 %s)", len(targets), start, end)
         ingest_documents(conn, client, targets)
+        ingest_companies(conn)
 
     dbt = dbtRunner()
     for cmd in (
@@ -164,6 +171,28 @@ def ingest_documents(
             logger.info("  %d/%d dates (last=%s, total rows=%d)", i, total, d, n)
 
 
+def ingest_companies(conn: duckdb.DuckDBPyConnection) -> None:
+    """EDINETコードリスト（提出者マスタ）を全件スナップショットで置き換える。
+
+    小さな全件 CSV のため日付単位の差分は持たず、毎回 全件 DELETE → INSERT で
+    最新スナップショットに置き換える。
+    """
+    rows = fetch_company_master()
+    fetched_at = datetime.now()
+    for r in rows:
+        r["_fetched_at"] = fetched_at
+    conn.execute("BEGIN")
+    conn.execute(f"DELETE FROM {COMPANIES_TABLE}")
+    if rows:
+        conn.register(
+            "_companies", pa.Table.from_pylist(rows, schema=_COMPANIES_ARROW_SCHEMA)
+        )
+        conn.execute(f"INSERT INTO {COMPANIES_TABLE} SELECT * FROM _companies")
+        conn.unregister("_companies")
+    conn.execute("COMMIT")
+    logger.info("companies snapshot: %d rows", len(rows))
+
+
 def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
     cols = ", ".join(f'"{f}" VARCHAR' for f in API_FIELDS)
     conn.execute(
@@ -172,6 +201,11 @@ def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
         f"CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} "
         "(fetch_date DATE, fetched_at TIMESTAMP, doc_count INTEGER)"
+    )
+    company_cols = ", ".join(f'"{f}" VARCHAR' for f in COMPANY_FIELDS)
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {COMPANIES_TABLE} "
+        f"({company_cols}, _fetched_at TIMESTAMP)"
     )
 
 
