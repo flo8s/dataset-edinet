@@ -25,6 +25,12 @@ import pyarrow as pa
 from dbt.cli.main import dbtRunner
 
 from edinet.client import EdinetClient
+from edinet.codelist import (
+    COMPANY_FIELDS,
+    FUND_FIELDS,
+    fetch_company_master,
+    fetch_fund_master,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -32,6 +38,8 @@ logger.addHandler(logging.StreamHandler())
 
 DOCUMENTS_TABLE = "edinet._source.documents"
 PROGRESS_TABLE = "edinet._source.fetch_progress"
+COMPANIES_TABLE = "edinet._source.companies"
+FUNDS_TABLE = "edinet._source.funds"
 
 # 書類一覧 API results の項目（出力順）。_source には VARCHAR でそのまま保持し、
 # 型付け・リネームは stg 層で行う（reinfolib と同じ方針）。
@@ -69,6 +77,14 @@ API_FIELDS = [
 
 _ARROW_SCHEMA = pa.schema(
     [(f, pa.string()) for f in API_FIELDS] + [("_fetch_date", pa.date32())]
+)
+
+_COMPANIES_ARROW_SCHEMA = pa.schema(
+    [(f, pa.string()) for f in COMPANY_FIELDS] + [("_fetched_at", pa.timestamp("us"))]
+)
+
+_FUNDS_ARROW_SCHEMA = pa.schema(
+    [(f, pa.string()) for f in FUND_FIELDS] + [("_fetched_at", pa.timestamp("us"))]
 )
 
 # 閲覧可能期間は書類種別ごとに最長 10 年（縦覧 + 延長）。これより古い日付は
@@ -136,6 +152,8 @@ def main() -> None:
         targets = _dates_to_fetch(conn, start, end)
         logger.info("fetch %d dates (%s 〜 %s)", len(targets), start, end)
         ingest_documents(conn, client, targets)
+        ingest_companies(conn)
+        ingest_funds(conn)
 
     dbt = dbtRunner()
     for cmd in (
@@ -164,6 +182,42 @@ def ingest_documents(
             logger.info("  %d/%d dates (last=%s, total rows=%d)", i, total, d, n)
 
 
+def ingest_companies(conn: duckdb.DuckDBPyConnection) -> None:
+    """EDINETコードリスト（提出者マスタ）を全件スナップショットで置き換える。"""
+    rows = fetch_company_master()
+    _replace_snapshot(conn, COMPANIES_TABLE, rows, _COMPANIES_ARROW_SCHEMA)
+    logger.info("companies snapshot: %d rows", len(rows))
+
+
+def ingest_funds(conn: duckdb.DuckDBPyConnection) -> None:
+    """ファンドコードリスト（ファンドマスタ）を全件スナップショットで置き換える。"""
+    rows = fetch_fund_master()
+    _replace_snapshot(conn, FUNDS_TABLE, rows, _FUNDS_ARROW_SCHEMA)
+    logger.info("funds snapshot: %d rows", len(rows))
+
+
+def _replace_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    rows: list[dict],
+    schema: pa.Schema,
+) -> None:
+    """小さな全件 CSV を 1 トランザクションで全件 DELETE → INSERT する。
+
+    日付単位の差分は持たず、毎回最新スナップショットに置き換える。
+    """
+    fetched_at = datetime.now()
+    for r in rows:
+        r["_fetched_at"] = fetched_at
+    conn.execute("BEGIN")
+    conn.execute(f"DELETE FROM {table}")
+    if rows:
+        conn.register("_snapshot", pa.Table.from_pylist(rows, schema=schema))
+        conn.execute(f"INSERT INTO {table} SELECT * FROM _snapshot")
+        conn.unregister("_snapshot")
+    conn.execute("COMMIT")
+
+
 def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
     cols = ", ".join(f'"{f}" VARCHAR' for f in API_FIELDS)
     conn.execute(
@@ -172,6 +226,15 @@ def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
         f"CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} "
         "(fetch_date DATE, fetched_at TIMESTAMP, doc_count INTEGER)"
+    )
+    company_cols = ", ".join(f'"{f}" VARCHAR' for f in COMPANY_FIELDS)
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {COMPANIES_TABLE} "
+        f"({company_cols}, _fetched_at TIMESTAMP)"
+    )
+    fund_cols = ", ".join(f'"{f}" VARCHAR' for f in FUND_FIELDS)
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {FUNDS_TABLE} ({fund_cols}, _fetched_at TIMESTAMP)"
     )
 
 
