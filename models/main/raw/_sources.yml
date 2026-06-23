@@ -9,3 +9,5 @@ sources:
         description: EDINET 書類一覧 API (documents.json, type=2) の提出書類メタデータ
       - name: companies
         description: EDINETコードリスト（EdinetcodeDlInfo.csv）の提出者マスタ
+      - name: funds
+        description: ファンドコードリスト（FundcodeDlInfo.csv）のファンドマスタ

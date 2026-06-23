@@ -1,12 +1,15 @@
-"""EDINET コードリスト（EDINETコード集約一覧）取得。
+"""EDINET コードリスト（提出者マスタ）・ファンドコードリスト（ファンドマスタ）取得。
 
-提出者（企業・ファンド等）のマスタ ``Edinetcode.zip`` をダウンロードし、
-中の ``EdinetcodeDlInfo.csv`` を解析して 1 提出者 1 行の dict で返す。
+EDINET が公開する 2 つのコードリスト ZIP をダウンロードし、中の CSV を
+解析して 1 行 1 dict のリストで返す。
+
+- EDINETコードリスト ``Edinetcode.zip`` → ``EdinetcodeDlInfo.csv``（提出者）
+- ファンドコードリスト ``Fundcode.zip`` → ``FundcodeDlInfo.csv``（ファンド）
 
 書類一覧 API と異なり API キーは不要な静的ファイルのダウンロードで、
 全件スナップショット（CSV は CP932・1 行目はメタ情報・2 行目がヘッダー）。
 
-出典: https://disclosure2.edinet-fsa.go.jp/ （EDINETコードリスト）
+出典: https://disclosure2.edinet-fsa.go.jp/ （EDINETコードリスト・ファンドコードリスト）
 """
 
 from __future__ import annotations
@@ -24,7 +27,11 @@ logger = logging.getLogger(__name__)
 CODELIST_URL = (
     "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/Edinetcode.zip"
 )
-CSV_NAME = "EdinetcodeDlInfo.csv"
+COMPANY_CSV_NAME = "EdinetcodeDlInfo.csv"
+FUNDLIST_URL = (
+    "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/Fundcode.zip"
+)
+FUND_CSV_NAME = "FundcodeDlInfo.csv"
 CSV_ENCODING = "cp932"
 
 # CSV の列順（日本語ヘッダー）に対応する英語キー。全項目 VARCHAR で _source に
@@ -45,34 +52,56 @@ COMPANY_FIELDS = [
     "corporate_number",  # 提出者法人番号（13桁）
 ]
 
+FUND_FIELDS = [
+    "fund_code",  # ファンドコード（G+5桁）
+    "sec_code",  # 証券コード（ファンドは多くが空）
+    "fund_name",  # ファンド名
+    "fund_name_kana",  # ファンド名（ヨミ）
+    "security_type",  # 特定有価証券区分名（内国投資信託受益証券 等）
+    "specified_period_1",  # 特定期1（決算期の月日テキスト）
+    "specified_period_2",  # 特定期2（月日テキスト。多くが空）
+    "edinet_code",  # ＥＤＩＮＥＴコード（発行者＝運用会社。mart_companies と結合）
+    "issuer_name",  # 発行者名
+]
 
-def fetch_company_master(
-    *, max_retries: int = 5, timeout: int = 60, retry_wait: float = 4.0
-) -> list[dict]:
-    """EDINETコードリストを取得し、提出者ごとの行 dict のリストを返す。
 
-    CSV は 1 行目がメタ情報（ダウンロード実行日・件数）、2 行目がヘッダー、
-    3 行目以降がデータ。ヘッダー行は捨て、列順で COMPANY_FIELDS に対応づける。
-    """
-    text = _download_csv()
-    reader = csv.reader(io.StringIO(text))
-    rows: list[dict] = []
-    for i, cols in enumerate(reader):
-        if i < 2:  # 1行目=メタ情報, 2行目=ヘッダー
-            continue
-        if not cols:
-            continue
-        values = (cols + [""] * len(COMPANY_FIELDS))[: len(COMPANY_FIELDS)]
-        rows.append({f: (v or None) for f, v in zip(COMPANY_FIELDS, values)})
+def fetch_company_master() -> list[dict]:
+    """EDINETコードリストを取得し、提出者ごとの行 dict のリストを返す。"""
+    rows = _fetch_codelist(CODELIST_URL, COMPANY_CSV_NAME, COMPANY_FIELDS)
     logger.info("fetched %d companies from code list", len(rows))
     return rows
 
 
-def _download_csv() -> str:
+def fetch_fund_master() -> list[dict]:
+    """ファンドコードリストを取得し、ファンドごとの行 dict のリストを返す。"""
+    rows = _fetch_codelist(FUNDLIST_URL, FUND_CSV_NAME, FUND_FIELDS)
+    logger.info("fetched %d funds from fund code list", len(rows))
+    return rows
+
+
+def _fetch_codelist(url: str, csv_name: str, fields: list[str]) -> list[dict]:
+    """コードリスト ZIP を取得し、列順で fields に対応づけた行 dict を返す。
+
+    CSV は 1 行目がメタ情報（ダウンロード実行日・件数）、2 行目がヘッダー、
+    3 行目以降がデータ。ヘッダー行は捨て、列順で fields に対応づける。
+    """
+    text = _download_csv(url, csv_name)
+    rows: list[dict] = []
+    for i, cols in enumerate(csv.reader(io.StringIO(text))):
+        if i < 2:  # 1行目=メタ情報, 2行目=ヘッダー
+            continue
+        if not cols:
+            continue
+        values = (cols + [""] * len(fields))[: len(fields)]
+        rows.append({f: (v or None) for f, v in zip(fields, values)})
+    return rows
+
+
+def _download_csv(url: str, csv_name: str) -> str:
     """ZIP をダウンロードし、中の CSV を CP932 デコードした文字列を返す。"""
-    raw = _download(CODELIST_URL)
+    raw = _download(url)
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        with zf.open(CSV_NAME) as f:
+        with zf.open(csv_name) as f:
             return f.read().decode(CSV_ENCODING)
 
 
