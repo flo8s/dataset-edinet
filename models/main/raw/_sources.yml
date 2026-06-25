@@ -11,3 +11,5 @@ sources:
         description: EDINETコードリスト（EdinetcodeDlInfo.csv）の提出者マスタ
       - name: funds
         description: ファンドコードリスト（FundcodeDlInfo.csv）のファンドマスタ
+      - name: financial_facts
+        description: 書類取得 API (type=5 CSV) の財務データ本体（要素ID×コンテキストの縦持ちファクト）
